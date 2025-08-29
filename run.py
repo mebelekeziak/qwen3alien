@@ -552,7 +552,6 @@ def main():
 
     if a.algo == "ppo":
         ppo_cfg = PPOConfig(
-            model_name=None,  # we pass model object directly
             learning_rate=a.lr,
             batch_size=a.bsz,
             mini_batch_size=a.mini_bsz,
@@ -573,7 +572,6 @@ def main():
         )
     else:
         grpo_cfg = GRPOConfig(
-            model_name=None,
             learning_rate=a.lr,
             batch_size=a.bsz,
             mini_batch_size=a.mini_bsz,
