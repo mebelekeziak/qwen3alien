@@ -53,6 +53,14 @@ from transformers import (
     set_seed,
 )
 
+# Optional Google GenAI client for remote scoring
+try:
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
+    HAS_GOOGLE_GENAI = True
+except Exception:
+    HAS_GOOGLE_GENAI = False
+
 # TRL imports (PPO always; GRPO optional)
 try:
     from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
@@ -187,13 +195,39 @@ class HumanDetector:
     Returns score in [0,1] where 1 = very human-like.
     """
 
-    def __init__(self, ppl_model_name: str = "gpt2", device: Optional[str] = None, use_adv: bool = True):
+    def __init__(self, ppl_model_name: str = "gpt2", device: Optional[str] = None, use_adv: bool = True, google_api_key: Optional[str] = None):
+        # Device for adversary and optional local PPL
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        # PPL LM
-        self.ppl_tok = AutoTokenizer.from_pretrained(ppl_model_name)
-        self.ppl_lm = AutoModelForCausalLM.from_pretrained(ppl_model_name).to(self.device)
-        self.ppl_lm.eval()
         self.use_adv = use_adv
+        self.remote_provider = None
+
+        # If ppl_model_name starts with "google:", configure remote PPL via Google API (Gemini/Gemma)
+        if isinstance(ppl_model_name, str) and ppl_model_name.lower().startswith("google:"):
+            self.remote_provider = "google"
+            self.google_model = ppl_model_name.split(":", 1)[1] or "gemma-3-4b-it"
+            # Prefer GEMINI_API_KEY, then GOOGLE_API_KEY
+            self.google_api_key = (
+                google_api_key
+                or os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY")
+            )
+            if not self.google_api_key:
+                print("[WARN] GEMINI_API_KEY/GOOGLE_API_KEY not set; falling back to local PPL model 'gpt2'.")
+                self.remote_provider = None
+                ppl_model_name = "gpt2"
+            elif not HAS_GOOGLE_GENAI:
+                print("[WARN] google-genai package not found. Install with 'pip install google-genai'. Falling back to local PPL 'gpt2'.")
+                self.remote_provider = None
+                ppl_model_name = "gpt2"
+            else:
+                # Initialize client
+                self.genai_client = google_genai.Client(api_key=self.google_api_key)
+
+        # Initialize local PPL model only if not using remote
+        if self.remote_provider is None:
+            self.ppl_tok = AutoTokenizer.from_pretrained(ppl_model_name)
+            self.ppl_lm = AutoModelForCausalLM.from_pretrained(ppl_model_name).to(self.device)
+            self.ppl_lm.eval()
         # Tiny adversary
         self.disc = CharHistDisc(hidden=64).to(self.device)
         self.disc_opt = torch.optim.AdamW(self.disc.parameters(), lr=1e-3)
@@ -204,12 +238,62 @@ class HumanDetector:
     def perplexity(self, text: str) -> float:
         if not text.strip():
             return 100.0  # very high ppl for empty (so low human score)
+        # Remote provider branch (Google API): return pseudo-PPL from a 0..1 score
+        if self.remote_provider == "google":
+            score = self._google_humanlikeness_score(text)
+            if score is None:
+                return 100.0
+            # Map score in (0,1] to a pseudo-perplexity so that s1 ~= score
+            # s1 = 1 / ppl  => ppl = 1 / s1
+            ppl = 1.0 / max(1e-6, min(1.0, float(score)))
+            return float(max(1.0, ppl))
+        # Local PPL branch
         toks = self.ppl_tok(text, return_tensors="pt").to(self.device)
         with torch.inference_mode():
             out = self.ppl_lm(**toks, labels=toks.input_ids)
             loss = out.loss.item()
         ppl = math.exp(min(20.0, max(0.0, loss)))
         return float(ppl)
+
+    def _google_humanlikeness_score(self, text: str) -> Optional[float]:
+        try:
+            # Build instruction to return only a numeric score in [0,1]
+            instruction = (
+                "You are a strict evaluator. Given the following text, output only a single number between 0 and 1 "
+                "representing how human-natural-language-like it is (1 = very human-like, 0 = not human-like). "
+                "Do not include any extra words or symbols."
+            )
+            user_prompt = f"{instruction}\n\nText:\n```\n{text}\n```\n\nScore:"
+            contents = [
+                google_genai_types.Content(
+                    role="user",
+                    parts=[google_genai_types.Part.from_text(text=user_prompt)],
+                )
+            ]
+            config = google_genai_types.GenerateContentConfig(
+                temperature=0.0,
+                top_p=0.0,
+                max_output_tokens=4,
+            )
+            out_text = ""
+            for chunk in self.genai_client.models.generate_content_stream(
+                model=self.google_model,
+                contents=contents,
+                config=config,
+            ):
+                if hasattr(chunk, "text") and chunk.text:
+                    out_text += chunk.text
+            out_text = (out_text or "").strip()
+            m = re.search(r"([01](?:\.\d+)?|0?\.\d+)", out_text)
+            if not m:
+                return None
+            val = float(m.group(1))
+            if 0.0 <= val <= 1.0:
+                return val
+            return None
+        except Exception as e:
+            print(f"[WARN] Google API PPL call failed: {e}")
+            return None
 
     def p_human(self, text: str) -> float:
         # Preprocess: try base64 decode; if plausible, score on decoded too (take max)
@@ -322,7 +406,11 @@ def build_query(user_prompt: str) -> str:
 class Args:
     model: str = "Qwen/Qwen2.5-7B-Instruct"
     ref_model: Optional[str] = None
-    ppl_model: str = "gpt2"
+    # Default to Google API Gemma for perplexity via remote call.
+    # Use format: "google:<model_name>" to hit Google API.
+    # Example: --ppl-model google:gemma-3-4b-it
+    # To use a local model instead, pass a HF id, e.g. --ppl-model gpt2
+    ppl_model: str = "google:gemma-3-4b-it"
     output_dir: str = "runs/no_human_think"
     seed: int = 42
     steps: int = 2000
@@ -417,6 +505,7 @@ def main():
     p.add_argument("--model", type=str, default=Args.model)
     p.add_argument("--ref-model", type=str, default=None)
     p.add_argument("--ppl-model", type=str, default=Args.ppl_model)
+    p.add_argument("--gemini-api-key", type=str, default=os.environ.get("GEMINI_API_KEY"))
     p.add_argument("--output-dir", type=str, default=Args.output_dir)
     p.add_argument("--seed", type=int, default=Args.seed)
     p.add_argument("--steps", type=int, default=Args.steps)
@@ -456,7 +545,7 @@ def main():
     model, ref_model, tok = make_policy_and_tokenizer(a)
 
     # Build detector
-    detector = HumanDetector(ppl_model_name=a.ppl_model, use_adv=not a.no_adv)
+    detector = HumanDetector(ppl_model_name=a.ppl_model, use_adv=not a.no_adv, google_api_key=a.gemini_api_key)
 
     # Optim/trainer configs
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
