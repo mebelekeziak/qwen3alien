@@ -42,6 +42,7 @@ import re
 import sys
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+import inspect
 
 import torch
 import torch.nn as nn
@@ -81,6 +82,22 @@ except Exception:
     HAS_PEFT = False
 
 # ------------------------- Utilities ---------------------------------------
+
+def _init_trl_config_compat(cfg_cls, **kwargs):
+    """Safely initialize TRL config classes across versions by dropping
+    unknown kwargs (e.g., 'log_with', 'project_kwargs' for older TRL).
+    """
+    try:
+        return cfg_cls(**kwargs)
+    except TypeError:
+        try:
+            sig = inspect.signature(cfg_cls)
+            allowed = set(sig.parameters.keys())
+            filtered = {k: v for k, v in kwargs.items() if k in allowed}
+            return cfg_cls(**filtered)
+        except Exception:
+            # Last resort: try with no extras
+            return cfg_cls()
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.S)
 
@@ -551,7 +568,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if a.algo == "ppo":
-        ppo_cfg = PPOConfig(
+        ppo_cfg = _init_trl_config_compat(
+            PPOConfig,
             learning_rate=a.lr,
             batch_size=a.bsz,
             mini_batch_size=a.mini_bsz,
@@ -571,7 +589,8 @@ def main():
             dataset=None,
         )
     else:
-        grpo_cfg = GRPOConfig(
+        grpo_cfg = _init_trl_config_compat(
+            GRPOConfig,
             learning_rate=a.lr,
             batch_size=a.bsz,
             mini_batch_size=a.mini_bsz,
