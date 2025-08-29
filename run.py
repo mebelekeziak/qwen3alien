@@ -99,6 +99,67 @@ def _init_trl_config_compat(cfg_cls, **kwargs):
             # Last resort: try with no extras
             return cfg_cls()
 
+
+def _build_trainer_compat(trainer_cls, cfg_obj, model, ref_model=None, tokenizer=None, maybe_dataset=None):
+    """Instantiate TRL trainers across versions by adapting parameter names.
+    Handles `config` vs `ppo_config`/`grpo_config` and optional `dataset`.
+    """
+    try:
+        sig = inspect.signature(trainer_cls)
+        params = list(sig.parameters.keys())
+    except Exception:
+        params = []
+
+    # Figure out the config param name
+    cfg_kw = None
+    for name in ("config", "ppo_config", "grpo_config"):
+        if name in params:
+            cfg_kw = name
+            break
+
+    # Assemble kwargs supported by this trainer
+    kwargs = {}
+    if cfg_kw is not None:
+        kwargs[cfg_kw] = cfg_obj
+    # Fallback: pass config positionally if no named param exists
+    positional_cfg = cfg_kw is None
+
+    if "model" in params:
+        kwargs["model"] = model
+    if "ref_model" in params and ref_model is not None:
+        kwargs["ref_model"] = ref_model
+    if "tokenizer" in params and tokenizer is not None:
+        kwargs["tokenizer"] = tokenizer
+    if "dataset" in params:
+        kwargs["dataset"] = maybe_dataset
+
+    # Try instantiation with selected kwargs
+    try:
+        if positional_cfg:
+            return trainer_cls(cfg_obj, **kwargs)
+        else:
+            return trainer_cls(**kwargs)
+    except TypeError:
+        # Last resort fallbacks: progressively drop rarely used kwargs
+        for drop in ("dataset", "tokenizer", "ref_model"):
+            if drop in kwargs:
+                kwargs.pop(drop)
+                try:
+                    if positional_cfg:
+                        return trainer_cls(cfg_obj, **kwargs)
+                    else:
+                        return trainer_cls(**kwargs)
+                except TypeError:
+                    continue
+        # Final attempt: bare minimum
+        if positional_cfg:
+            return trainer_cls(cfg_obj, model)
+        else:
+            base = {k: v for k, v in kwargs.items() if k in ("model",)}
+            if cfg_kw:
+                base[cfg_kw] = cfg_obj
+            return trainer_cls(**base)
+
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.S)
 
 HUMAN_SEED_TEXT = [
@@ -581,12 +642,13 @@ def main():
             kl_penalty="kl",
             seed=a.seed,
         )
-        trainer = PPOTrainer(
-            config=ppo_cfg,
+        trainer = _build_trainer_compat(
+            PPOTrainer,
+            ppo_cfg,
             model=model,
             ref_model=ref_model,
             tokenizer=tok,
-            dataset=None,
+            maybe_dataset=None,
         )
     else:
         grpo_cfg = _init_trl_config_compat(
@@ -599,11 +661,13 @@ def main():
             target_kl=0.1,
             seed=a.seed,
         )
-        trainer = GRPOTrainer(
-            config=grpo_cfg,
+        trainer = _build_trainer_compat(
+            GRPOTrainer,
+            grpo_cfg,
             model=model,
             ref_model=ref_model,
             tokenizer=tok,
+            maybe_dataset=None,
         )
 
     # Arithmetic sampler
