@@ -206,7 +206,10 @@ def main():
         # Generation settings used for sampling during GRPO:
         max_prompt_length=768,
         max_completion_length=512,
-        num_generations=8,     # G in GRPO
+        # num_generations must divide generation_batch_size. By default,
+        # TRL infers generation_batch_size ~= per_device_train_batch_size * gradient_accumulation_steps (=4).
+        # Set to 4 to satisfy 4 % 4 == 0 and reduce VRAM use.
+        num_generations=4,     # G in GRPO
         temperature=0.8,
         top_p=0.95,
         repetition_penalty=1.0,
