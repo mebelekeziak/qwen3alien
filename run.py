@@ -13,6 +13,7 @@ from typing import List, Tuple, Optional
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
 from transformers import AutoTokenizer
+import torch
 
 # --- Google GenAI (verifier) ---
 from google import genai
@@ -190,6 +191,14 @@ def main():
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
+    # Prefer CUDA if available and choose a suitable dtype
+    use_cuda = torch.cuda.is_available()
+    torch_dtype = (
+        torch.bfloat16 if use_cuda and torch.cuda.is_bf16_supported() else
+        (torch.float16 if use_cuda else torch.float32)
+    )
+    print(f"Device: {'cuda' if use_cuda else 'cpu'} | dtype: {torch_dtype}")
+
     # GRPO settings — simple/sane defaults; tune as you wish.
     args = GRPOConfig(
         output_dir="qwen3-4b-grpo-nohuman-think",
@@ -220,6 +229,14 @@ def main():
         beta=0.0,              # KL off by default per TRL guidance
         log_completions=True,
         num_completions_to_print=1,
+        model_init_kwargs={
+            "device_map": "auto" if use_cuda else None,
+            "torch_dtype": torch_dtype,
+            # Optional: enable if your setup supports it
+            # "attn_implementation": "flash_attention_2",
+            # Optional: reduce VRAM via 4-bit quantization (requires bitsandbytes)
+            # "load_in_4bit": True,
+        },
         # If you’re tight on VRAM, you can also pass:
         # model_init_kwargs={"load_in_4bit": True}
     )
