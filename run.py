@@ -65,8 +65,9 @@ class HumanLanguageVerifier:
     Uses Google's GenAI SDK to ask gemma-3-1b-it if text is human language.
     Returns (is_human_language: Optional[bool], confidence: float, detected_language: str)
     """
-    def __init__(self, model: str = VERIFIER_MODEL_ID):
-        api_key = _get_google_genai_api_key()
+    def __init__(self, model: str = VERIFIER_MODEL_ID, api_key: Optional[str] = None):
+        # Prefer explicitly provided key; otherwise fall back to env/Colab secrets.
+        api_key = api_key or _get_google_genai_api_key()
         if not api_key:
             raise RuntimeError(
                 "Missing Google GenAI API key. Set GEMINI_API_KEY/GOOGLE_API_KEY "
@@ -134,7 +135,7 @@ class HumanLanguageVerifier:
 # ------------ Reward function ------------
 # TRL passes `completions` shaped like: List[List[{"role": "assistant", "content": "..."}]]
 # (see TRL GRPO docs). We'll robustly extract text.
-_verifier = None  # lazy init so script can import without Google key
+_verifier = None  # lazy init; can be pre-set from CLI in main()
 
 def _extract_text_from_completion(completion) -> str:
     # completion could be: [{"role": "assistant", "content": "..."}] or just {"content": "..."} or a plain str
@@ -159,6 +160,7 @@ def reward_no_human_language_in_think(completions, **kwargs) -> List[float]:
     """
     global _verifier
     if _verifier is None:
+        # Fall back to env/Colab if no CLI-provided verifier was created in main().
         _verifier = HumanLanguageVerifier()
 
     rewards = []
@@ -181,7 +183,7 @@ def reward_no_human_language_in_think(completions, **kwargs) -> List[float]:
 
 
 # ------------ Training ------------
-def main(steps: int = 500):
+def main(steps: int = 500, google_api_key: Optional[str] = None):
     # Prompts: UltraFeedback prompts are fine as generic stimulus.
     ds = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
 
@@ -213,6 +215,14 @@ def main(steps: int = 500):
         return example
 
     ds = ds.map(add_prefix)
+
+    # Initialize global verifier with CLI-provided API key if given.
+    global _verifier
+    if google_api_key:
+        # Also export to env so any subprocesses/workers inherit it.
+        os.environ.setdefault("GOOGLE_API_KEY", google_api_key)
+        os.environ.setdefault("GEMINI_API_KEY", google_api_key)
+        _verifier = HumanLanguageVerifier(api_key=google_api_key)
 
     # Ensure tokenizer pad side is left (recommended for generation training)
     tok = AutoTokenizer.from_pretrained(POLICY_MODEL_ID, use_fast=True)
@@ -289,5 +299,13 @@ if __name__ == "__main__":
         default=500,
         help="Hard limit on total training steps (overrides epochs).",
     )
+    parser.add_argument(
+        "--google-api-key",
+        "--gemini-api-key",
+        dest="google_api_key",
+        type=str,
+        default=None,
+        help="Google GenAI (Gemini) API key to use for the verifier.",
+    )
     cli_args = parser.parse_args()
-    main(steps=cli_args.steps)
+    main(steps=cli_args.steps, google_api_key=cli_args.google_api_key)
