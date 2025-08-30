@@ -156,8 +156,29 @@ def main():
     ds = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
 
     # Prepend a tiny formatting instruction so the model reliably emits <think> then <final>.
+    def _normalize_prompt(p) -> str:
+        """Coerce dataset prompt field to a plain string.
+        Handles str, list[str|dict], dict, or other types gracefully.
+        """
+        if isinstance(p, str):
+            return p
+        if isinstance(p, list):
+            parts = []
+            for item in p:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("content", "")))
+                else:
+                    parts.append(str(item))
+            return "\n".join(s for s in parts if s)
+        if isinstance(p, dict):
+            # Common chat-like single dict with content
+            if "content" in p:
+                return str(p.get("content", ""))
+            return json.dumps(p, ensure_ascii=False)
+        return str(p)
+
     def add_prefix(example):
-        p = example.get("prompt", "")
+        p = _normalize_prompt(example.get("prompt", ""))
         example["prompt"] = PROMPT_PREFIX + p
         return example
 
