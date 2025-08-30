@@ -184,6 +184,9 @@ def reward_no_human_language_in_think(completions, **kwargs) -> List[float]:
 
 # ------------ Training ------------
 def main(steps: int = 500, google_api_key: Optional[str] = None):
+    # Reduce CUDA memory fragmentation per PyTorch note in OOM error
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     # Prompts: UltraFeedback prompts are fine as generic stimulus.
     ds = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
 
@@ -220,8 +223,8 @@ def main(steps: int = 500, google_api_key: Optional[str] = None):
     global _verifier
     if google_api_key:
         # Also export to env so any subprocesses/workers inherit it.
+        # Set only one to avoid google-genai warning about both being set.
         os.environ.setdefault("GOOGLE_API_KEY", google_api_key)
-        os.environ.setdefault("GEMINI_API_KEY", google_api_key)
         _verifier = HumanLanguageVerifier(api_key=google_api_key)
 
     # Ensure tokenizer pad side is left (recommended for generation training)
@@ -242,23 +245,25 @@ def main(steps: int = 500, google_api_key: Optional[str] = None):
     args = GRPOConfig(
         output_dir="qwen3-4b-grpo-nohuman-think",
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
+        # Keep micro-batch small and reduce generation batch size
+        gradient_accumulation_steps=1,
         learning_rate=1e-6,
         num_train_epochs=1.0,
         max_steps=steps,
         logging_steps=5,
         save_steps=200,
         save_total_limit=2,
-        bf16=True,  # if your GPUs support it
+        # Enable bf16 only if actually using bfloat16
+        bf16=bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
         gradient_checkpointing=True,
 
         # Generation settings used for sampling during GRPO:
-        max_prompt_length=768,
-        max_completion_length=512,
+        max_prompt_length=384,
+        max_completion_length=256,
         # num_generations must divide generation_batch_size. By default,
-        # TRL infers generation_batch_size ~= per_device_train_batch_size * gradient_accumulation_steps (=4).
-        # Set to 4 to satisfy 4 % 4 == 0 and reduce VRAM use.
-        num_generations=4,     # G in GRPO
+        # TRL infers generation_batch_size ~= per_device_train_batch_size * gradient_accumulation_steps.
+        # With per_device_train_batch_size=1 and gradient_accumulation_steps=1, set num_generations=1.
+        num_generations=1,     # G in GRPO
         temperature=0.8,
         top_p=0.95,
         repetition_penalty=1.0,
@@ -272,10 +277,17 @@ def main(steps: int = 500, google_api_key: Optional[str] = None):
         model_init_kwargs={
             "device_map": "auto" if use_cuda else None,
             "torch_dtype": torch_dtype,
-            # Optional: enable if your setup supports it
+            # Disable KV-cache during training to save VRAM
+            "use_cache": False,
+            # Reduce VRAM via 4-bit quantization (requires bitsandbytes in requirements)
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_compute_dtype": torch_dtype,
+            "bnb_4bit_use_double_quant": True,
+            # Optional: enable if your setup supports it for speed/memory
             # "attn_implementation": "flash_attention_2",
-            # Optional: reduce VRAM via 4-bit quantization (requires bitsandbytes)
-            # "load_in_4bit": True,
+            # Also reduce host RAM usage when loading
+            "low_cpu_mem_usage": True,
         },
         # If you’re tight on VRAM, you can also pass:
         # model_init_kwargs={"load_in_4bit": True}
