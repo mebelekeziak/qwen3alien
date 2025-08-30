@@ -4,6 +4,7 @@
 # Verifier: gemma-3-1b-it (Google GenAI API)
 
 import os
+import argparse
 import re
 import json
 import time
@@ -18,6 +19,31 @@ import torch
 # --- Google GenAI (verifier) ---
 from google import genai
 from google.genai import types
+
+
+def _get_google_genai_api_key() -> Optional[str]:
+    """Return Google GenAI API key from env or Colab secrets.
+
+    Tries common env var names first, then falls back to
+    google.colab.userdata for notebooks using the Colab Secrets UI.
+    """
+    # 1) Environment variables
+    for key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"):
+        val = os.environ.get(key_name)
+        if val:
+            return val
+
+    # 2) Colab secrets (UI: ‘Secrets’ tab)
+    try:
+        from google.colab import userdata  # type: ignore
+        for key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"):
+            val = userdata.get(key_name)
+            if val:
+                return val
+    except Exception:
+        pass
+
+    return None
 
 
 # ------------ Config ------------
@@ -40,9 +66,12 @@ class HumanLanguageVerifier:
     Returns (is_human_language: Optional[bool], confidence: float, detected_language: str)
     """
     def __init__(self, model: str = VERIFIER_MODEL_ID):
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        api_key = _get_google_genai_api_key()
         if not api_key:
-            raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY for google-genai.")
+            raise RuntimeError(
+                "Missing Google GenAI API key. Set GEMINI_API_KEY/GOOGLE_API_KEY "
+                "as env vars or add them in Colab Secrets."
+            )
         self.client = genai.Client(api_key=api_key)
         self.model = model
 
@@ -152,7 +181,7 @@ def reward_no_human_language_in_think(completions, **kwargs) -> List[float]:
 
 
 # ------------ Training ------------
-def main():
+def main(steps: int = 500):
     # Prompts: UltraFeedback prompts are fine as generic stimulus.
     ds = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
 
@@ -206,6 +235,7 @@ def main():
         gradient_accumulation_steps=4,
         learning_rate=1e-6,
         num_train_epochs=1.0,
+        max_steps=steps,
         logging_steps=5,
         save_steps=200,
         save_total_limit=2,
@@ -248,10 +278,16 @@ def main():
         reward_funcs=reward_no_human_language_in_think,
         processing_class=tok,  # ensures left padding + pad token setup
     )
-
     trainer.train()
     trainer.save_model()  # save PEFT/full model per your settings
 
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train GRPO with no-human-think reward")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=500,
+        help="Hard limit on total training steps (overrides epochs).",
+    )
+    cli_args = parser.parse_args()
+    main(steps=cli_args.steps)
