@@ -1,11 +1,7 @@
-# Core runtime
-transformers>=4.40.0
-trl>=0.9.0
-peft>=0.11.0
-accelerate>=0.27.0
-
-# Optional: remote human-likeness scoring via Google GenAI
-google-genai>=0.3.0
-
-# Optional: some HF models/tokenizers require this
-sentencepiece>=0.1.99
+trl>=0.22
+transformers
+datasets
+accelerate
+peft
+bitsandbytes
+google-genai
